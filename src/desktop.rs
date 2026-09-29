@@ -1,12 +1,12 @@
 //! The computer-use actions on one Hyprland monitor, in the scaled pixel space its screenshots use.
 
-use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::keyboard::{Keyboard, Modifier};
 use crate::pointer::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Pointer, Wheel};
 
 /// How long the screen gets to settle before the screenshot that answers an action.
@@ -76,6 +76,13 @@ struct Monitor {
     scale: f64,
     transform: u8,
     focused: bool,
+    #[serde(rename = "dpmsStatus")]
+    dpms_status: bool,
+}
+
+fn monitors() -> Result<Vec<Monitor>, String> {
+    serde_json::from_slice(&run("hyprctl", &["monitors", "-j"])?)
+        .map_err(|e| format!("hyprctl monitors: {e}"))
 }
 
 fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -95,9 +102,7 @@ fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
 impl Display {
     /// The monitor named `wanted`, else the focused one; screenshots are at most `max_width` wide.
     pub fn pick(wanted: Option<&str>, max_width: f64) -> Result<Self, String> {
-        let monitors: Vec<Monitor> = serde_json::from_slice(&run("hyprctl", &["monitors", "-j"])?)
-            .map_err(|e| format!("hyprctl monitors: {e}"))?;
-        let monitor = monitors
+        let monitor = monitors()?
             .into_iter()
             .find(|m| match wanted {
                 Some(name) => m.name == name,
@@ -148,6 +153,12 @@ impl Display {
         )
     }
 
+    fn lit(&self) -> Result<bool, String> {
+        Ok(monitors()?
+            .iter()
+            .any(|m| m.name == self.name && m.dpms_status))
+    }
+
     /// The whole monitor at screenshot size, cursor included.
     pub fn screenshot(&self) -> Result<Vec<u8>, String> {
         let geometry = format!("{},{} {}x{}", self.x, self.y, self.width, self.height);
@@ -173,6 +184,7 @@ impl Display {
 pub struct Computer {
     display: Display,
     pointer: Option<Pointer>,
+    keyboard: Option<Keyboard>,
 }
 
 impl Computer {
@@ -180,7 +192,15 @@ impl Computer {
         Self {
             display,
             pointer: None,
+            keyboard: None,
         }
+    }
+
+    fn keyboard(&mut self) -> Result<&mut Keyboard, String> {
+        if self.keyboard.is_none() {
+            self.keyboard = Some(Keyboard::connect()?);
+        }
+        Ok(self.keyboard.as_mut().expect("just connected"))
     }
 
     pub fn display(&self) -> &Display {
@@ -266,10 +286,10 @@ impl Computer {
         Ok(self.display.local(parse(x)?, parse(y)?))
     }
 
-    /// Press `button` `clicks` times, with `modifiers` held throughout.
-    fn click(&mut self, button: u32, clicks: u32, modifiers: Option<&str>) -> Result<(), String> {
+    /// Press `button` `clicks` times, with `mods` held throughout.
+    fn click(&mut self, button: u32, clicks: u32, mods: &[Modifier]) -> Result<(), String> {
         self.focus_under_cursor()?;
-        let held = hold_modifiers(modifiers, 150 + 120 * u64::from(clicks))?;
+        self.keyboard()?.press_mods(mods)?;
         for at in 0..clicks {
             if at > 0 {
                 sleep(Duration::from_millis(60));
@@ -278,11 +298,55 @@ impl Computer {
             pointer.button(button, true)?;
             pointer.button(button, false)?;
         }
-        release(held)
+        self.keyboard()?.release_mods(mods)
+    }
+
+    /// Tap one chord, or hold it for `hold`.
+    fn press(&mut self, chord_text: &str, hold: Option<Duration>) -> Result<(), String> {
+        let (mut mods, key) = chord(chord_text)?;
+        let keyboard = self.keyboard()?;
+        // A lone modifier, or one last in the chord, is pressed as a modifier so clients see its state.
+        if let Some(m) = Modifier::named(&key) {
+            mods.push(m);
+            keyboard.press_mods(&mods)?;
+            if let Some(hold) = hold {
+                sleep(hold);
+            }
+            return keyboard.release_mods(&mods);
+        }
+        match hold {
+            Some(hold) => keyboard.hold(&key, &mods, hold),
+            None => keyboard.tap(&key, &mods),
+        }
+    }
+
+    /// Stir the pointer when the monitor is off, so the idle daemon lights it as it would for a person, and give it a moment.
+    fn wake(&mut self) -> Result<(), String> {
+        if self.display.lit()? {
+            return Ok(());
+        }
+        self.pointer()?.nudge()?;
+        for _ in 0..30 {
+            sleep(Duration::from_millis(100));
+            if self.display.lit()? {
+                sleep(SETTLE);
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "monitor {} stayed off after the pointer moved; is the session locked?",
+            self.display.name
+        ))
     }
 
     pub fn act(&mut self, input: Input) -> Result<Reply, String> {
-        let modifiers = input.text.as_deref();
+        if input.action != "wait" {
+            self.wake()?;
+        }
+        let held = || match input.text.as_deref().map(str::trim) {
+            Some(text) if !text.is_empty() => modifiers(&text.split('+').collect::<Vec<_>>()),
+            _ => Ok(Vec::new()),
+        };
         match input.action.as_str() {
             "screenshot" => return self.shot(None),
             "zoom" => {
@@ -313,7 +377,7 @@ impl Computer {
                     "triple_click" => (BTN_LEFT, 3),
                     _ => (BTN_LEFT, 1),
                 };
-                self.click(button, clicks, modifiers)?;
+                self.click(button, clicks, &held()?)?;
             }
             "left_mouse_down" | "left_mouse_up" => {
                 if let Some(at) = input.coordinate {
@@ -362,42 +426,25 @@ impl Computer {
                     }
                 };
                 let notches = input.scroll_amount.unwrap_or(3);
-                let held = hold_modifiers(modifiers, 150 + 40 * u64::from(notches))?;
+                let mods = held()?;
+                self.keyboard()?.press_mods(&mods)?;
                 self.pointer()?.scroll(wheel, notches)?;
-                release(held)?;
+                self.keyboard()?.release_mods(&mods)?;
             }
             "key" => {
-                let keys = input.text.ok_or("key needs text")?;
+                let keys = input.text.as_deref().ok_or("key needs text")?;
                 for chord in keys.split_whitespace() {
-                    let args = chord_args(chord)?;
-                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                    run("wtype", &args)?;
+                    self.press(chord, None)?;
                 }
             }
             "hold_key" => {
-                let key = input.text.ok_or("hold_key needs text")?;
-                let millis = (input.duration.unwrap_or(1.0) * 1000.0).round() as u64;
-                let args = hold_args(&key, millis)?;
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                run("wtype", &args)?;
+                let key = input.text.as_deref().ok_or("hold_key needs text")?;
+                let hold = Duration::from_secs_f64(input.duration.unwrap_or(1.0).clamp(0.0, 100.0));
+                self.press(key, Some(hold))?;
             }
             "type" => {
-                let text = input.text.ok_or("type needs text")?;
-                let mut child = Command::new("wtype")
-                    .args(["-d", "4", "-"])
-                    .stdin(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| format!("wtype: {e}"))?;
-                child
-                    .stdin
-                    .take()
-                    .ok_or("wtype took no input")?
-                    .write_all(text.as_bytes())
-                    .map_err(|e| format!("wtype: {e}"))?;
-                let status = child.wait().map_err(|e| format!("wtype: {e}"))?;
-                if !status.success() {
-                    return Err("wtype failed to type".into());
-                }
+                let text = input.text.as_deref().ok_or("type needs text")?;
+                self.keyboard()?.type_text(text)?;
             }
             "wait" => sleep(Duration::from_secs_f64(
                 input.duration.unwrap_or(1.0).clamp(0.0, 100.0),
@@ -416,18 +463,6 @@ impl Computer {
             ..Default::default()
         })
     }
-}
-
-/// wtype's name for an xdotool modifier, or `None` when `name` is an ordinary key.
-fn modifier(name: &str) -> Option<&'static str> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "ctrl" | "control" | "control_l" | "control_r" => "ctrl",
-        "shift" | "shift_l" | "shift_r" => "shift",
-        "alt" | "alt_l" | "alt_r" | "option" => "alt",
-        "super" | "super_l" | "super_r" | "cmd" | "command" | "meta" | "win" | "logo" => "logo",
-        "altgr" => "altgr",
-        _ => return None,
-    })
 }
 
 /// The xkb keysym an xdotool key name means.
@@ -459,93 +494,21 @@ fn keysym(name: &str) -> String {
     }
 }
 
-/// `ctrl+shift+t` as wtype arguments: the modifiers pressed around one typed key.
-fn chord_args(chord: &str) -> Result<Vec<String>, String> {
+/// `ctrl+shift+t` as the modifiers to hold and the keysym name of the key; a lone modifier is its own key.
+fn chord(chord: &str) -> Result<(Vec<Modifier>, String), String> {
     let parts: Vec<&str> = chord.split('+').filter(|p| !p.is_empty()).collect();
     let (key, mods) = parts
         .split_last()
         .ok_or_else(|| format!("{chord:?} names no key"))?;
-    let mods = mods
+    let mods = modifiers(mods)?;
+    Ok((mods, keysym(key)))
+}
+
+fn modifiers(names: &[&str]) -> Result<Vec<Modifier>, String> {
+    names
         .iter()
-        .map(|m| modifier(m).ok_or_else(|| format!("{m} is not a modifier")))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut args = Vec::new();
-    for m in &mods {
-        args.extend(["-M".to_string(), m.to_string()]);
-    }
-    args.extend(["-k".to_string(), keysym(key)]);
-    for m in mods.iter().rev() {
-        args.extend(["-m".to_string(), m.to_string()]);
-    }
-    Ok(args)
-}
-
-/// Hold one key or chord for `millis`.
-fn hold_args(chord: &str, millis: u64) -> Result<Vec<String>, String> {
-    let parts: Vec<&str> = chord.split('+').filter(|p| !p.is_empty()).collect();
-    let (key, mods) = parts
-        .split_last()
-        .ok_or_else(|| format!("{chord:?} names no key"))?;
-    let mut args = Vec::new();
-    for m in mods {
-        let m = modifier(m).ok_or_else(|| format!("{m} is not a modifier"))?;
-        args.extend(["-M".to_string(), m.to_string()]);
-    }
-    match modifier(key) {
-        Some(m) => args.extend([
-            "-M".to_string(),
-            m.to_string(),
-            "-s".to_string(),
-            millis.to_string(),
-            "-m".to_string(),
-            m.to_string(),
-        ]),
-        None => args.extend([
-            "-P".to_string(),
-            keysym(key),
-            "-s".to_string(),
-            millis.to_string(),
-            "-p".to_string(),
-            keysym(key),
-        ]),
-    }
-    Ok(args)
-}
-
-/// Modifiers held by a background wtype for `millis`, since they release when it exits.
-fn hold_modifiers(
-    modifiers: Option<&str>,
-    millis: u64,
-) -> Result<Option<std::process::Child>, String> {
-    let Some(modifiers) = modifiers.filter(|m| !m.trim().is_empty()) else {
-        return Ok(None);
-    };
-    let mods = modifiers
-        .split('+')
-        .map(|m| modifier(m.trim()).ok_or_else(|| format!("{m} is not a modifier")))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut args = Vec::new();
-    for m in &mods {
-        args.extend(["-M".to_string(), m.to_string()]);
-    }
-    args.extend(["-s".to_string(), millis.to_string()]);
-    for m in mods.iter().rev() {
-        args.extend(["-m".to_string(), m.to_string()]);
-    }
-    let child = Command::new("wtype")
-        .args(&args)
-        .spawn()
-        .map_err(|e| format!("wtype: {e}"))?;
-    // Give the compositor the press before the click that depends on it.
-    sleep(Duration::from_millis(80));
-    Ok(Some(child))
-}
-
-fn release(held: Option<std::process::Child>) -> Result<(), String> {
-    if let Some(mut child) = held {
-        child.wait().map_err(|e| format!("wtype: {e}"))?;
-    }
-    Ok(())
+        .map(|m| Modifier::named(m.trim()).ok_or_else(|| format!("{m} is not a modifier")))
+        .collect()
 }
 
 #[cfg(test)]
@@ -553,29 +516,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_chord_presses_its_modifiers_around_the_key() {
+    fn a_chord_splits_into_modifiers_and_a_key() {
         assert_eq!(
-            chord_args("ctrl+shift+t").unwrap(),
-            [
-                "-M", "ctrl", "-M", "shift", "-k", "t", "-m", "shift", "-m", "ctrl"
-            ]
+            chord("ctrl+shift+t").unwrap(),
+            (vec![Modifier::Ctrl, Modifier::Shift], "t".to_string())
         );
-        assert_eq!(chord_args("Return").unwrap(), ["-k", "Return"]);
-        assert_eq!(chord_args("super").unwrap(), ["-k", "Super_L"]);
-        assert_eq!(chord_args("f5").unwrap(), ["-k", "F5"]);
-        assert!(chord_args("tab+x").is_err());
-    }
-
-    #[test]
-    fn a_held_key_sleeps_between_press_and_release() {
-        assert_eq!(
-            hold_args("shift", 500).unwrap(),
-            ["-M", "shift", "-s", "500", "-m", "shift"]
-        );
-        assert_eq!(
-            hold_args("ctrl+a", 200).unwrap(),
-            ["-M", "ctrl", "-P", "a", "-s", "200", "-p", "a"]
-        );
+        assert_eq!(chord("Return").unwrap(), (vec![], "Return".to_string()));
+        assert_eq!(chord("super").unwrap(), (vec![], "Super_L".to_string()));
+        assert_eq!(chord("f5").unwrap(), (vec![], "F5".to_string()));
+        assert!(chord("tab+x").is_err());
     }
 
     #[test]

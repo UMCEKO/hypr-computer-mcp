@@ -1,9 +1,12 @@
 //! The Anthropic computer-use tool (`computer`, same actions and parameters) as a stdio MCP server driving Hyprland.
 
+mod awake;
 mod desktop;
+mod keyboard;
 mod pointer;
 
 use std::io::{BufRead as _, Write as _};
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -109,7 +112,17 @@ fn call(computer: &mut Computer, params: &Value) -> Value {
     }
 }
 
+/// How long the session stays held awake after the last action, `HYPR_COMPUTER_AWAKE_MINUTES` (0 turns it off).
+fn awake() -> Option<awake::Awake> {
+    let minutes = std::env::var("HYPR_COMPUTER_AWAKE_MINUTES")
+        .ok()
+        .and_then(|m| m.parse::<u64>().ok())
+        .unwrap_or(15);
+    (minutes > 0).then(|| awake::Awake::new(Duration::from_secs(minutes * 60)))
+}
+
 fn serve(mut computer: Computer) -> Result<(), String> {
+    let awake = awake();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -137,7 +150,12 @@ fn serve(mut computer: Computer) -> Result<(), String> {
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": [tool(computer.display())] })),
-            "tools/call" => Ok(call(&mut computer, &message["params"])),
+            "tools/call" => {
+                if let Some(awake) = &awake {
+                    awake.renew();
+                }
+                Ok(call(&mut computer, &message["params"]))
+            }
             other => Err(json!({ "code": -32601, "message": format!("no method {other}") })),
         };
         let reply = match result {
