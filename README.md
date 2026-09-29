@@ -21,7 +21,8 @@ and typed the git commands into a terminal, working from screenshots.
   carries no position, every warp is followed by a net-zero 1px wiggle so the
   client sees where the pointer is.
 - A click focuses the window under the cursor first; otherwise Hyprland spends
-  the click on focusing it.
+  the click on focusing it. When focusing slides the window, as a scrolling
+  layout does, the click waits out the animation and follows the window.
 - Keys and text go through a `zwp_virtual_keyboard_v1` laid out like a US
   keyboard, so each character arrives on the key it has there. wtype numbers
   keys in the order characters first appear, and Chromium reads punctuation by

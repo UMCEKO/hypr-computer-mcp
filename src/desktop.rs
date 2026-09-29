@@ -85,6 +85,38 @@ fn monitors() -> Result<Vec<Monitor>, String> {
         .map_err(|e| format!("hyprctl monitors: {e}"))
 }
 
+fn clients() -> Result<Vec<Client>, String> {
+    serde_json::from_slice(&run("hyprctl", &["clients", "-j"])?)
+        .map_err(|e| format!("hyprctl clients: {e}"))
+}
+
+#[derive(Deserialize)]
+struct Animation {
+    name: String,
+    overridden: bool,
+    enabled: bool,
+    speed: f64,
+}
+
+/// How long a window takes to slide, from the first of `windowsMove`, `windows` and `global` the config sets; speed is in tenths of a second.
+fn move_animation() -> Duration {
+    let fallback = Duration::from_millis(500);
+    let Ok(out) = run("hyprctl", &["animations", "-j"]) else {
+        return fallback;
+    };
+    let Ok((animations, _)) = serde_json::from_slice::<(Vec<Animation>, serde_json::Value)>(&out)
+    else {
+        return fallback;
+    };
+    ["windowsMove", "windows", "global"]
+        .iter()
+        .find_map(|name| animations.iter().find(|a| a.name == *name && a.overridden))
+        .map_or(fallback, |a| match a.enabled {
+            true => Duration::from_secs_f64(a.speed / 10.0) + Duration::from_millis(80),
+            false => Duration::ZERO,
+        })
+}
+
 fn run(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new(program)
         .args(args)
@@ -241,8 +273,7 @@ impl Computer {
             .ok_or_else(|| format!("hyprctl cursorpos said {text}"))?;
         let parse = |v: &str| v.trim().parse::<f64>().map_err(|e| e.to_string());
         let (x, y) = (parse(x)?, parse(y)?);
-        let clients: Vec<Client> = serde_json::from_slice(&run("hyprctl", &["clients", "-j"])?)
-            .map_err(|e| format!("hyprctl clients: {e}"))?;
+        let windows = clients()?;
         let monitors: Vec<ActiveWorkspace> =
             serde_json::from_slice(&run("hyprctl", &["monitors", "-j"])?)
                 .map_err(|e| format!("hyprctl monitors: {e}"))?;
@@ -251,7 +282,7 @@ impl Computer {
             .flat_map(|m| [m.active_workspace.id, m.special_workspace.id])
             .filter(|id| *id != 0)
             .collect();
-        let under = clients
+        let under = windows
             .iter()
             .filter(|c| c.mapped && !c.hidden && shown.contains(&c.workspace.id))
             .filter(|c| {
@@ -272,8 +303,18 @@ impl Computer {
         run("hyprctl", &["dispatch", &lua])
             .or_else(|_| run("hyprctl", &["dispatch", "focuswindow", &window]))?;
         sleep(Duration::from_millis(60));
+        // A scrolling layout slides a focused window into view, so the click follows the window it was aimed at.
+        let (dx, dy) = clients()?
+            .iter()
+            .find(|c| c.address == under.address)
+            .map_or((0.0, 0.0), |c| {
+                (c.at[0] - under.at[0], c.at[1] - under.at[1])
+            });
+        if (dx, dy) != (0.0, 0.0) {
+            sleep(move_animation());
+        }
         // Focusing warps the cursor to the window's middle, so it goes back to where the click is meant.
-        self.warp(x.round() as i64, y.round() as i64)
+        self.warp((x + dx).round() as i64, (y + dy).round() as i64)
     }
 
     fn cursor(&self) -> Result<(i64, i64), String> {
