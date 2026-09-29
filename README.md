@@ -22,7 +22,11 @@ and typed the git commands into a terminal, working from screenshots.
   client sees where the pointer is.
 - A click focuses the window under the cursor first; otherwise Hyprland spends
   the click on focusing it.
-- Keys and text go through `wtype`. Key names use xdotool syntax (`Return`,
+- Keys and text go through a `zwp_virtual_keyboard_v1` laid out like a US
+  keyboard, so each character arrives on the key it has there. wtype numbers
+  keys in the order characters first appear, and Chromium reads punctuation by
+  key position, so a `-` that happened to land on Backspace's code erased the
+  character before it. Key names use xdotool syntax (`Return`,
   `ctrl+shift+t`).
 - While it's in use, it holds an `org.freedesktop.ScreenSaver` inhibit and a
   logind `idle:sleep` block, so the screen doesn't lock or blank and the
@@ -32,7 +36,7 @@ and typed the git commands into a terminal, working from screenshots.
 
 ## Setup
 
-Needs Hyprland, `grim` and `wtype` on `PATH`.
+Needs Hyprland, and `grim` on `PATH`.
 
 ```sh
 cargo build --release
